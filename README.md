@@ -72,11 +72,15 @@ For the **first (or only) calibration image**:
 
 > **Tip:** Click **"+ Add Target"** if you have more than 2 targets
 
+![Image of Main Tab](https://github.com/MoritzNelle/GUI-Software-to-calibrate-Thermal-Images-with-Calibration-Targets/blob/main/GUI_screenshots/GUI_Home.png)
+
 **Step 4: Check the coefficients**
 - As you enter ground truth values, coefficients auto-update
 - You'll see: `m = 1.0234, b = -0.45, R² = 0.9987`
 - `R² > 0.99` indicates excellent calibration
 - Click **"📊 View Regression Plot"** to see the fit visually
+
+![Image of Regression Plot](https://github.com/MoritzNelle/GUI-Software-to-calibrate-Thermal-Images-with-Calibration-Targets/blob/main/GUI_screenshots/GUI_Regression_Plot.png)
 
 **Step 5: For multi-image calibration (recommended)**
 - Click the second image in the listbox (e.g., `[End]`)
@@ -98,11 +102,14 @@ Switch to **Tab 2 (Batch Processing)**:
 
 **Step 3: Process**
 1. Enter the Input and Output directories
-1. Click **"Start Batch Processing"**
-2. Each image is calibrated based on its timestamp:
+2. Click **"Start Batch Processing"**
+3. Each image is calibrated based on its timestamp:
    - Before start calibration: uses start coefficients
    - Between start/end: interpolated coefficients
    - After end calibration: uses end coefficients
+  
+![Image of Batch Tab](https://github.com/MoritzNelle/GUI-Software-to-calibrate-Thermal-Images-with-Calibration-Targets/blob/main/GUI_screenshots/GUI_Batch.png)
+  
 
 ### Phase 4: Verify Output
 
