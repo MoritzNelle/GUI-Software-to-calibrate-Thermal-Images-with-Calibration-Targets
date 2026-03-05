@@ -2,9 +2,6 @@
 Thermal Image Calibration Tool for DJI M4T Drone
 =================================================
 Corrects thermal drift in uncooled microbolometer sensors using the Empirical Line Method.
-
-Author: SmartWheat Project
-Date: 2026
 """
 
 import tkinter as tk
@@ -116,39 +113,73 @@ class EmissivitySettings:
 # UTILITY FUNCTIONS
 # =============================================================================
 
+def _parse_datetime_string(dt_str: str) -> Optional[datetime]:
+    """Parse a datetime string using multiple formats, returning a naive datetime."""
+    if not dt_str or not dt_str.strip():
+        return None
+    dt_str = dt_str.strip()
+    # Normalize trailing 'Z' to +00:00 for fromisoformat
+    if dt_str.endswith('Z'):
+        dt_str = dt_str[:-1] + '+00:00'
+    # Try fromisoformat first (handles ISO8601 including timezone)
+    try:
+        dt = datetime.fromisoformat(dt_str)
+        # Strip timezone to keep all datetimes naive & consistent
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+    except Exception:
+        pass
+    # Try common alternative formats
+    for fmt in ('%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%S.%f%z',
+                '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f',
+                '%Y:%m:%d %H:%M:%S', '%Y-%m-%d %H:%M:%S',
+                '%Y:%m:%d %H:%M:%S.%f'):
+        try:
+            dt = datetime.strptime(dt_str, fmt)
+            if dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
+            return dt
+        except Exception:
+            continue
+    return None
+
+
 def extract_datetime_from_exif(image_path: str) -> Optional[datetime]:
     """Extract DateTime from image metadata.
     Tries (in order):
-     - XMP xmp:CreateDate (handles ISO8601 with timezone)
-     - piexif DateTimeOriginal / DateTime
-     - Pillow _getexif DateTimeOriginal / DateTime
-     - file modification time as last resort
+     1. XMP xmp:CreateDate within XMP packet boundaries (handles ISO8601)
+     2. piexif DateTimeOriginal / DateTime
+     3. rasterio TIFF tags (works well with thermal GeoTIFFs)
+     4. Pillow _getexif DateTimeOriginal / DateTime
+     5. file modification time as last resort
+    All returned datetimes are timezone-naive for consistent arithmetic.
     """
     import re
     import os
 
-    # 1) Try XMP CreateDate (common in DJI TIFF/JPEG XMP metadata)
+    # 1) Try XMP CreateDate – only search within XMP packet to avoid
+    #    false matches in binary pixel data of large thermal TIFFs.
     try:
         with open(image_path, 'rb') as f:
             content = f.read()
-        m = re.search(rb'xmp:CreateDate="([^"]+)"', content)
+        # Locate XMP packet boundaries
+        xmp_start = content.find(b'<?xpacket begin')
+        xmp_end = content.find(b'<?xpacket end')
+        if xmp_start >= 0 and xmp_end > xmp_start:
+            xmp_data = content[xmp_start:xmp_end + 200]
+        else:
+            # No packet markers – restrict search to first 256 KB
+            # (TIFF/JPEG metadata is at the beginning of the file)
+            xmp_data = content[:262144]
+        m = re.search(rb'xmp:CreateDate="([^"]+)"', xmp_data)
         if not m:
-            m = re.search(rb'CreateDate="([^"]+)"', content)  # fallback
+            m = re.search(rb'CreateDate="([^"]+)"', xmp_data)
         if m:
             dt_str = m.group(1).decode('utf-8', errors='ignore').strip()
-            # Normalize trailing 'Z' to +00:00 for fromisoformat
-            if dt_str.endswith('Z'):
-                dt_str = dt_str[:-1] + '+00:00'
-            try:
-                return datetime.fromisoformat(dt_str)
-            except Exception:
-                # Try common alternative formats
-                for fmt in ('%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%S.%f%z',
-                            '%Y-%m-%dT%H:%M:%S', '%Y:%m:%d %H:%M:%S'):
-                    try:
-                        return datetime.strptime(dt_str, fmt)
-                    except Exception:
-                        continue
+            result = _parse_datetime_string(dt_str)
+            if result:
+                return result
     except Exception:
         pass
 
@@ -166,18 +197,27 @@ def extract_datetime_from_exif(image_path: str) -> Optional[datetime]:
                 dt_str = dt_bytes.decode('utf-8', errors='ignore').strip()
             else:
                 dt_str = str(dt_bytes)
-            try:
-                return datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S')
-            except Exception:
-                for fmt in ('%Y-%m-%d %H:%M:%S', '%Y:%m:%d %H:%M:%S.%f'):
-                    try:
-                        return datetime.strptime(dt_str, fmt)
-                    except Exception:
-                        continue
+            result = _parse_datetime_string(dt_str)
+            if result:
+                return result
     except Exception:
         pass
 
-    # 3) Pillow _getexif fallback
+    # 3) Try rasterio TIFF tags (reliable for thermal GeoTIFFs)
+    try:
+        with rasterio.open(image_path) as src:
+            tags = src.tags()
+            for key in ('TIFFTAG_DATETIME', 'DateTime', 'datetime',
+                        'TIFFTAG_DATETIMEORIGINAL', 'DateTimeOriginal'):
+                dt_str = tags.get(key)
+                if dt_str:
+                    result = _parse_datetime_string(dt_str)
+                    if result:
+                        return result
+    except Exception:
+        pass
+
+    # 4) Pillow _getexif fallback
     try:
         img = Image.open(image_path)
         exif = getattr(img, "_getexif", None)
@@ -188,19 +228,13 @@ def extract_datetime_from_exif(image_path: str) -> Optional[datetime]:
                 for tag, val in raw.items():
                     name = TAGS.get(tag, tag)
                     if name in ('DateTimeOriginal', 'DateTime'):
-                        dt_str = val
-                        try:
-                            return datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S')
-                        except Exception:
-                            for fmt in ('%Y-%m-%d %H:%M:%S', '%Y:%m:%d %H:%M:%S.%f'):
-                                try:
-                                    return datetime.strptime(dt_str, fmt)
-                                except Exception:
-                                    continue
+                        result = _parse_datetime_string(str(val))
+                        if result:
+                            return result
     except Exception:
         pass
 
-    # 4) Last resort: file modification time
+    # 5) Last resort: file modification time
     try:
         return datetime.fromtimestamp(os.path.getmtime(image_path))
     except Exception:
@@ -1446,6 +1480,7 @@ class ThermalCalibrationApp:
                 self._log(f"Processing: {filename}")
                 
                 timestamp = extract_datetime_from_exif(str(img_path)) or datetime.now()
+                self._log(f"  Timestamp: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
                 m, b = interpolate_coefficients(timestamp, event_start, event_end)
                 
                 img_data = load_thermal_image(str(img_path))
@@ -1544,6 +1579,18 @@ class ThermalCalibrationApp:
         self._log(f"Output folder: {output_folder}")
         self._log(f"Detailed log: processing_log.csv")
         self._log(f"Summary: processing_summary.txt")
+        
+        # Display processing_log.csv contents in the log window
+        try:
+            self._log(f"\n{'=' * 70}")
+            self._log("PROCESSING LOG (processing_log.csv)")
+            self._log(f"{'=' * 70}")
+            csv_text = log_df.to_string(index=False)
+            self.log_text.insert(tk.END, csv_text + "\n")
+            self.log_text.see(tk.END)
+            self.root.update_idletasks()
+        except Exception:
+            pass
         
         self.progress_label.config(text="Complete!")
         self.status_var.set(f"Batch processing complete. {len(log_data)} images processed.")
