@@ -1,11 +1,13 @@
 """
-Thermal Image Calibration Tool for DJI M4T Drone
+Image Calibration Tool (Thermal & Multispectral)
 =================================================
-Corrects thermal drift in uncooled microbolometer sensors using the Empirical Line Method.
+Corrects sensor drift using the Empirical Line Method.
+Supports thermal images (temperature calibration) and multispectral
+single-band images (reflectance calibration without irradiance sensor).
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, messagebox
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageTk, ImageDraw
@@ -92,8 +94,8 @@ class CalibrationEvent:
         self.targets.append(target)
         return target
     
-    def remove_target(self, index: int) -> bool:
-        if len(self.targets) <= 2:
+    def remove_target(self, index: int, min_targets: int = 2) -> bool:
+        if len(self.targets) <= min_targets:
             return False
         if 0 <= index < len(self.targets):
             self.targets.pop(index)
@@ -447,49 +449,50 @@ class TargetRowWidget:
         self.on_gt_change = on_gt_change
         self.frame = ttk.Frame(parent)
         self.frame.pack(fill=tk.X, padx=2, pady=2)
+        self.frame.columnconfigure(5, weight=1)  # stats column stretches
         
         # Color indicator
         self.color_label = tk.Label(self.frame, bg=color, width=2, relief='raised')
-        self.color_label.pack(side=tk.LEFT, padx=2)
+        self.color_label.grid(row=0, column=0, padx=2, sticky='w')
         
         # Target name label
         self.name_label = ttk.Label(self.frame, text=f"T{index+1}", width=3)
-        self.name_label.pack(side=tk.LEFT, padx=2)
+        self.name_label.grid(row=0, column=1, padx=2, sticky='w')
         
-        # Draw polygon button
-        self.draw_btn = ttk.Button(self.frame, text="Draw", width=5,
+        # Buttons sub-frame keeps Draw+Clear together
+        btn_frame = ttk.Frame(self.frame)
+        btn_frame.grid(row=0, column=2, padx=2, sticky='w')
+        self.draw_btn = ttk.Button(btn_frame, text="Draw", width=5,
                                    command=lambda: on_draw(self.index))
-        self.draw_btn.pack(side=tk.LEFT, padx=2)
-        
-        # Clear polygon button
-        self.clear_btn = ttk.Button(self.frame, text="Clear", width=5,
+        self.draw_btn.pack(side=tk.LEFT, padx=1)
+        self.clear_btn = ttk.Button(btn_frame, text="Clear", width=5,
                                     command=lambda: on_clear(self.index))
-        self.clear_btn.pack(side=tk.LEFT, padx=2)
+        self.clear_btn.pack(side=tk.LEFT, padx=1)
         
         # Ground truth entry with colored background
         self.gt_var = tk.StringVar()
         self.gt_var.trace_add('write', self._on_gt_modified)
-        self.gt_entry = tk.Entry(self.frame, width=8, bg=lighten_color(color), 
+        self.gt_entry = tk.Entry(self.frame, width=9, bg=lighten_color(color), 
                                  fg='black', font=('TkDefaultFont', 9, 'bold'),
                                  textvariable=self.gt_var)
-        self.gt_entry.pack(side=tk.LEFT, padx=2)
+        self.gt_entry.grid(row=0, column=3, padx=2, sticky='w')
         
         # Mean/Std label
-        self.stats_label = ttk.Label(self.frame, text="Mean: -", width=22)
-        self.stats_label.pack(side=tk.LEFT, padx=2)
+        self.stats_label = ttk.Label(self.frame, text="Mean: -")
+        self.stats_label.grid(row=0, column=4, padx=2, sticky='w')
         
         # Remove button
         self.remove_btn = ttk.Button(self.frame, text="×", width=2,
                                      command=lambda: on_remove(self.index))
-        self.remove_btn.pack(side=tk.RIGHT, padx=2)
+        self.remove_btn.grid(row=0, column=5, padx=2, sticky='e')
         
     def _on_gt_modified(self, *args):
         """Called when ground truth entry is modified."""
         self.on_gt_change()
     
-    def set_stats(self, mean: float, std: float):
+    def set_stats(self, mean: float, std: float, unit: str = "°C"):
         if mean != 0:
-            self.stats_label.config(text=f"Mean: {mean:.2f}°C, σ: {std:.2f}")
+            self.stats_label.config(text=f"Mean: {mean:.2f}{unit}, σ: {std:.2f}")
         else:
             self.stats_label.config(text="Mean: -")
             
@@ -521,7 +524,9 @@ class RegressionPlotDialog:
     """
 
     def __init__(self, parent, drone_temps: List[float], ground_truths: List[float],
-                 labels: Optional[List[str]] = None, title: str = "Regression: Drone vs Ground Truth"):
+                 labels: Optional[List[str]] = None, title: str = "Regression: Drone vs Ground Truth",
+                 xlabel: str = "Drone ROI mean temperature (\u00b0C)",
+                 ylabel: str = "Ground Truth (IR gun) temperature (\u00b0C)"):
         if not HAS_MATPLOTLIB:
             from tkinter import messagebox
             messagebox.showerror("Matplotlib required",
@@ -532,6 +537,8 @@ class RegressionPlotDialog:
         self.drone = list(drone_temps)
         self.ground = list(ground_truths)
         self.labels = labels or [f"T{i+1}" for i in range(len(self.drone))]
+        self.xlabel = xlabel
+        self.ylabel = ylabel
 
         # Create dialog window
         self.win = tk.Toplevel(parent)
@@ -597,8 +604,8 @@ class RegressionPlotDialog:
             # fallback: no fit
             pass
 
-        self.ax.set_xlabel("Drone ROI mean temperature (°C)")
-        self.ax.set_ylabel("Ground Truth (IR gun) temperature (°C)")
+        self.ax.set_xlabel(self.xlabel)
+        self.ax.set_ylabel(self.ylabel)
         self.ax.set_title("Drone vs Ground Truth Regression")
         self.ax.grid(alpha=0.3)
         self.ax.set_aspect('auto')
@@ -622,12 +629,19 @@ class RegressionPlotDialog:
 # =============================================================================
 
 class ThermalCalibrationApp:
-    """Main application for thermal image calibration."""
+    """Main application for thermal / multispectral image calibration."""
+    
+    # Mode constants
+    MODE_THERMAL = "thermal"
+    MODE_MSI = "msi"
     
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Thermal Image Calibration Tool - DJI M4T")
+        self.root.title("Image Calibration Tool – Thermal / MSI")
         self.root.geometry("1500x950")
+        
+        # Sensor mode
+        self.sensor_mode = tk.StringVar(value=self.MODE_THERMAL)
         
         # State variables
         self.calibration_events: List[CalibrationEvent] = []
@@ -654,16 +668,155 @@ class ThermalCalibrationApp:
         
         self._setup_ui()
         
+    # -- helpers that return mode-dependent text --------------------------
+    def _is_thermal(self) -> bool:
+        return self.sensor_mode.get() == self.MODE_THERMAL
+
+    def _is_single_point(self) -> bool:
+        """True when MSI single-point (K = refl / DN) calibration is active."""
+        return (not self._is_thermal()) and self.msi_single_point.get()
+
+    def _unit(self) -> str:
+        return "°C" if self._is_thermal() else "DN"
+
+    def _gt_label(self) -> str:
+        return "GT (°C)" if self._is_thermal() else "GT (Refl 0–1)"
+
+    def _readout_idle(self) -> str:
+        u = self._unit()
+        return f"Value: - {u} | Move cursor over image"
+
+    def _update_targets_tooltip(self):
+        """Refresh the targets help tooltip for current mode."""
+        if self._is_thermal():
+            text = ("For each target:\n"
+                    "1. Click 'Draw' to draw a 4-point polygon\n"
+                    "2. Click 4 corners on the image\n"
+                    "3. Enter the IR Gun temperature (°C) in the GT field\n\n"
+                    "Coefficients update automatically when ≥2 complete targets.")
+        else:
+            text = ("For each reflectance panel:\n"
+                    "1. Click 'Draw' to draw a 4-point polygon\n"
+                    "2. Click 4 corners on the panel in the image\n"
+                    "3. Enter the known reflectance as a fraction\n"
+                    "   (0–1, e.g. 50 %  →  0.5) in the GT field\n\n"
+                    "Calibrate one band at a time (load single-band images).")
+        # Recreate tooltip
+        try:
+            self.targets_help_btn.unbind("<Enter>")
+            self.targets_help_btn.unbind("<Leave>")
+        except Exception:
+            pass
+        ToolTip(self.targets_help_btn, text)
+
+    def _on_mode_switch(self):
+        """Called when user toggles between Thermal and MSI mode."""
+        is_thermal = self._is_thermal()
+
+        # Update window title
+        mode_str = "Thermal" if is_thermal else "MSI"
+        self.root.title(f"Image Calibration Tool – {mode_str}")
+
+        # Show / hide emissivity frame (thermal only)
+        if is_thermal:
+            self.emis_frame.pack(fill=tk.X, padx=5, pady=5)
+        else:
+            self.emis_frame.pack_forget()
+
+        # Show / hide MSI sub-options
+        if is_thermal:
+            self.msi_options_frame.pack_forget()
+        else:
+            # Insert after mode frame, before Step 1
+            self.msi_options_frame.pack(fill=tk.X, padx=5, pady=5,
+                                        after=self.mode_frame)
+        self._on_single_point_toggle()
+
+        # Update header label in targets section
+        self.gt_header_label.config(text=self._gt_label())
+
+        # Update tooltip
+        self._update_targets_tooltip()
+
+        # Update pixel readout
+        self.temp_label.config(text=self._readout_idle())
+
+        # Update stats labels in target rows
+        if self.calibration_events:
+            event = self.calibration_events[self.current_event_index]
+            for i, row in enumerate(self.target_rows):
+                if i < len(event.targets):
+                    row.set_stats(event.targets[i].drone_mean,
+                                  event.targets[i].drone_std, self._unit())
+
+        self.status_var.set(f"Switched to {mode_str} mode.")
+
+    def _on_single_point_toggle(self):
+        """Show/hide multi-target controls depending on calibration method."""
+        single = self._is_single_point()
+
+        # Keep target count consistent with selected calibration method.
+        changed = self._normalize_targets_for_mode()
+
+        if single:
+            # In single-point mode only one target is needed
+            self.targets_frame.config(text="Step 2: Define CRP Target")
+            self.add_target_btn.pack_forget()
+            self.coeff_frame.config(text="Calibration Coefficient K (auto-updated)")
+            # No regression curve for a single data point
+            self.plot_btn.pack_forget()
+            self.plot_help_label.pack_forget()
+        else:
+            self.targets_frame.config(text="Step 2: Define Targets (min 2)")
+            self.add_target_btn.pack(fill=tk.X, padx=5, pady=5)
+            self.coeff_frame.config(text="Calibration Coefficients (auto-updated)")
+            self.plot_btn.pack(side=tk.LEFT)
+            self.plot_help_label.pack(side=tk.LEFT, padx=5)
+
+        if changed:
+            self._rebuild_target_rows()
+            self._update_display()
+
+        self._auto_calculate_coefficients()
+        self._update_coeff_display()
+
+    def _normalize_targets_for_mode(self) -> bool:
+        """Ensure target count matches mode constraints. Returns True if modified."""
+        if not self.calibration_events:
+            return False
+
+        changed = False
+        if self._is_single_point():
+            # Single-point MSI must have exactly one CRP target.
+            for event in self.calibration_events:
+                if not event.targets:
+                    event.targets = [CalibrationTarget('Target 1', COLOR_PALETTE[0])]
+                    changed = True
+                elif len(event.targets) > 1:
+                    event.targets = [event.targets[0]]
+                    changed = True
+        else:
+            # Thermal and MSI multi-point modes require at least two targets.
+            for event in self.calibration_events:
+                while len(event.targets) < 2:
+                    event.add_target()
+                    changed = True
+
+        if changed:
+            self.active_target_index = None
+        return changed
+
     def _setup_ui(self):
         """Setup the main UI layout."""
-        # Status bar at top
-        status_frame = ttk.Frame(self.root)
-        status_frame.pack(fill=tk.X, padx=5, pady=2)
-        self.status_label = ttk.Label(status_frame, textvariable=self.status_var,
+        # ---- top bar: status only ----
+        top_frame = ttk.Frame(self.root)
+        top_frame.pack(fill=tk.X, padx=5, pady=2)
+
+        self.status_label = ttk.Label(top_frame, textvariable=self.status_var,
                                       font=('TkDefaultFont', 10, 'italic'),
                                       foreground='#0066CC')
         self.status_label.pack(side=tk.LEFT, padx=5)
-        
+
         # Main container with tabs
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -681,7 +834,7 @@ class ThermalCalibrationApp:
     def _setup_calibration_tab(self):
         """Setup calibration tab UI."""
         # Left panel: Controls (scrollable)
-        left_container = ttk.Frame(self.tab_calibration, width=440)
+        left_container = ttk.Frame(self.tab_calibration, width=480)
         left_container.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
         left_container.pack_propagate(False)
         
@@ -698,6 +851,40 @@ class ThermalCalibrationApp:
         
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas_scroll.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # --- Sensor Mode (at top of left panel) ---
+        self.mode_frame = ttk.LabelFrame(self.left_frame, text="Sensor Mode")
+        self.mode_frame.pack(fill=tk.X, padx=5, pady=5)
+        mode_row = ttk.Frame(self.mode_frame)
+        mode_row.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Radiobutton(mode_row, text="Thermal", variable=self.sensor_mode,
+                        value=self.MODE_THERMAL,
+                        command=self._on_mode_switch).pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(mode_row, text="Multispectral (MSI)", variable=self.sensor_mode,
+                        value=self.MODE_MSI,
+                        command=self._on_mode_switch).pack(side=tk.LEFT, padx=6)
+
+        # --- MSI sub-options (hidden by default) ---
+        self.msi_single_point = tk.BooleanVar(value=True)
+        self.msi_options_frame = ttk.LabelFrame(self.left_frame, text="MSI Calibration Method")
+        # (not packed yet – shown only when MSI is active)
+        sp_row = ttk.Frame(self.msi_options_frame)
+        sp_row.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Radiobutton(sp_row, text="Single-Point (1 CRP)",
+                        variable=self.msi_single_point, value=True,
+                        command=self._on_single_point_toggle).pack(anchor=tk.W)
+        ttk.Radiobutton(sp_row, text="Multi-Point ELM (≥2 targets)",
+                        variable=self.msi_single_point, value=False,
+                        command=self._on_single_point_toggle).pack(anchor=tk.W)
+        sp_help = ttk.Label(self.msi_options_frame, text="❓", cursor="hand2",
+                            foreground='#0066CC')
+        sp_help.pack(anchor=tk.E, padx=5)
+        ToolTip(sp_help,
+                "Single-Point: K = ρ_CRP / DN_CRP – requires only one\n"
+                "calibration panel. Good for agricultural drones that\n"
+                "auto-correct internal offsets (b≈0).\n\n"
+                "Multi-Point ELM: ρ = m·DN + b – requires ≥2 panels\n"
+                "of different reflectance for a full linear fit.")
         
         # --- Load Calibration Images ---
         load_frame = ttk.LabelFrame(self.left_frame, text="Step 1: Load Calibration Images")
@@ -744,81 +931,80 @@ class ThermalCalibrationApp:
                         command=self._update_display).pack(anchor=tk.W, padx=5)
         
         # --- Targets Section ---
-        targets_frame = ttk.LabelFrame(self.left_frame, text="Step 2: Define Targets (min 2)")
-        targets_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.targets_frame = ttk.LabelFrame(self.left_frame, text="Step 2: Define Targets (min 2)")
+        self.targets_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        # Header with help
-        header = ttk.Frame(targets_frame)
+        # Header row – use a grid so columns align with the target rows
+        header = ttk.Frame(self.targets_frame)
         header.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(header, text="Col", width=3).pack(side=tk.LEFT)
-        ttk.Label(header, text="ID", width=3).pack(side=tk.LEFT)
-        ttk.Label(header, text="Actions", width=12).pack(side=tk.LEFT, padx=5)
-        ttk.Label(header, text="GT (°C)", width=8).pack(side=tk.LEFT)
-        ttk.Label(header, text="Drone Stats", width=20).pack(side=tk.LEFT)
+        header.columnconfigure(5, weight=1)  # stats column stretches
+        ttk.Label(header, text="Col",  width=3).grid(row=0, column=0, padx=2, sticky='w')
+        ttk.Label(header, text="ID",   width=3).grid(row=0, column=1, padx=2, sticky='w')
+        ttk.Label(header, text="Actions", width=11).grid(row=0, column=2, padx=2, sticky='w')
+        self.gt_header_label = ttk.Label(header, text=self._gt_label(), width=9)
+        self.gt_header_label.grid(row=0, column=3, padx=2, sticky='w')
+        ttk.Label(header, text="Drone Stats").grid(row=0, column=4, padx=2, sticky='w')
         
         help_btn2 = ttk.Label(header, text="❓", cursor="hand2", foreground='#0066CC')
-        help_btn2.pack(side=tk.RIGHT, padx=2)
-        ToolTip(help_btn2, "For each target:\n"
-                          "1. Click 'Draw' to start drawing a 4-point polygon\n"
-                          "2. Click 4 corners on the image (polygon auto-completes)\n"
-                          "3. Enter the IR Gun temperature in the colored GT field\n\n"
-                          "Coefficients update automatically when you have ≥2 complete targets.")
+        help_btn2.grid(row=0, column=5, padx=2, sticky='e')
+        self.targets_help_btn = help_btn2
+        self._update_targets_tooltip()
         
         # Target rows container
-        self.targets_container = ttk.Frame(targets_frame)
+        self.targets_container = ttk.Frame(self.targets_frame)
         self.targets_container.pack(fill=tk.X, padx=5, pady=5)
         
         # Add target button
-        self.add_target_btn = ttk.Button(targets_frame, text="+ Add Target", 
+        self.add_target_btn = ttk.Button(self.targets_frame, text="+ Add Target", 
                                           command=self._add_target)
         self.add_target_btn.pack(fill=tk.X, padx=5, pady=5)
         
         # --- Coefficients Display ---
-        coeff_frame = ttk.LabelFrame(self.left_frame, text="Calibration Coefficients (auto-updated)")
-        coeff_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.coeff_frame = ttk.LabelFrame(self.left_frame, text="Calibration Coefficients (auto-updated)")
+        self.coeff_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        self.coeff_label = ttk.Label(coeff_frame, text="m = -, b = -, R² = -",
+        self.coeff_label = ttk.Label(self.coeff_frame, text="m = -, b = -, R² = -",
                                      font=('TkDefaultFont', 10, 'bold'))
         self.coeff_label.pack(padx=5, pady=5)
         
         # View regression button
-        btn_row2 = ttk.Frame(coeff_frame)
+        btn_row2 = ttk.Frame(self.coeff_frame)
         btn_row2.pack(fill=tk.X, padx=5, pady=5)
         self.plot_btn = ttk.Button(btn_row2, text="📊 View Regression Plot", 
                                    command=self._show_regression_plot)
         self.plot_btn.pack(side=tk.LEFT)
         
-        help_btn3 = ttk.Label(btn_row2, text="❓", cursor="hand2", foreground='#0066CC')
-        help_btn3.pack(side=tk.LEFT, padx=5)
-        ToolTip(help_btn3, "Opens a plot showing:\n"
+        self.plot_help_label = ttk.Label(btn_row2, text="❓", cursor="hand2", foreground='#0066CC')
+        self.plot_help_label.pack(side=tk.LEFT, padx=5)
+        ToolTip(self.plot_help_label, "Opens a plot showing:\n"
                           "• Your data points (drone temp vs ground truth)\n"
                           "• The regression line fit\n"
                           "• R² value indicating fit quality\n\n"
                           "Use this to visually validate your calibration.")
         
-        # --- Emissivity Settings ---
-        emis_frame = ttk.LabelFrame(self.left_frame, text="Emissivity Correction (Optional)")
-        emis_frame.pack(fill=tk.X, padx=5, pady=5)
+        # --- Emissivity Settings (thermal only) ---
+        self.emis_frame = ttk.LabelFrame(self.left_frame, text="Emissivity Correction (Optional)")
+        self.emis_frame.pack(fill=tk.X, padx=5, pady=5)
         
         self.emis_enabled = tk.BooleanVar(value=False)
-        emis_check = ttk.Checkbutton(emis_frame, text="Enable Emissivity Correction",
+        emis_check = ttk.Checkbutton(self.emis_frame, text="Enable Emissivity Correction",
                         variable=self.emis_enabled)
         emis_check.pack(anchor=tk.W, padx=5)
         
-        help_btn4 = ttk.Label(emis_frame, text="❓", cursor="hand2", foreground='#0066CC')
+        help_btn4 = ttk.Label(self.emis_frame, text="❓", cursor="hand2", foreground='#0066CC')
         help_btn4.pack(anchor=tk.E, padx=5)
         ToolTip(help_btn4, "Corrects for non-blackbody emission using:\n"
                           "T_obj = ⁴√[(T_app⁴ - (1-ε)·T_sky⁴) / ε]\n\n"
                           "Only needed if targets have known emissivity different from 1.0")
         
-        emis_row1 = ttk.Frame(emis_frame)
+        emis_row1 = ttk.Frame(self.emis_frame)
         emis_row1.pack(fill=tk.X, padx=5, pady=2)
         ttk.Label(emis_row1, text="Target ε:").pack(side=tk.LEFT)
         self.emis_value = ttk.Entry(emis_row1, width=10)
         self.emis_value.insert(0, "0.95")
         self.emis_value.pack(side=tk.LEFT, padx=5)
         
-        emis_row2 = ttk.Frame(emis_frame)
+        emis_row2 = ttk.Frame(self.emis_frame)
         emis_row2.pack(fill=tk.X, padx=5, pady=2)
         ttk.Label(emis_row2, text="T_sky (°C):").pack(side=tk.LEFT)
         self.tsky_value = ttk.Entry(emis_row2, width=10)
@@ -836,8 +1022,8 @@ class ThermalCalibrationApp:
         self.canvas = tk.Canvas(canvas_frame, bg='gray20')
         self.canvas.pack(fill=tk.BOTH, expand=True)
         
-        # Temperature readout
-        self.temp_label = ttk.Label(right_frame, text="Temperature: - °C | Move cursor over image",
+        # Pixel readout
+        self.temp_label = ttk.Label(right_frame, text=self._readout_idle(),
                                     font=('TkDefaultFont', 10))
         self.temp_label.pack(anchor=tk.W, padx=5, pady=2)
         
@@ -850,14 +1036,29 @@ class ThermalCalibrationApp:
         settings_frame = ttk.LabelFrame(self.tab_processing, text="Processing Settings")
         settings_frame.pack(fill=tk.X, padx=10, pady=10)
         
-        # Survey folder
+        # Survey images – folder OR file selection
         folder_row1 = ttk.Frame(settings_frame)
         folder_row1.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(folder_row1, text="Survey Images Folder:").pack(side=tk.LEFT)
-        self.survey_entry = ttk.Entry(folder_row1, width=60)
+        ttk.Label(folder_row1, text="Survey Images:").pack(side=tk.LEFT)
+        self.survey_entry = ttk.Entry(folder_row1, width=55)
         self.survey_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Button(folder_row1, text="Browse", 
-                   command=self._browse_survey_folder).pack(side=tk.LEFT)
+        ttk.Button(folder_row1, text="Folder",
+                   command=self._browse_survey_folder).pack(side=tk.LEFT, padx=2)
+        ttk.Button(folder_row1, text="Files…",
+                   command=self._browse_survey_files).pack(side=tk.LEFT, padx=2)
+        
+        # Filename filter
+        filter_row = ttk.Frame(settings_frame)
+        filter_row.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(filter_row, text="Filename filter:").pack(side=tk.LEFT)
+        self.filter_var = tk.StringVar()
+        self.filter_entry = ttk.Entry(filter_row, width=20, textvariable=self.filter_var)
+        self.filter_entry.pack(side=tk.LEFT, padx=5)
+        filter_help = ttk.Label(filter_row, text="❓", cursor="hand2", foreground='#0066CC')
+        filter_help.pack(side=tk.LEFT)
+        ToolTip(filter_help, "Only process files whose name contains this text.\n"
+                             "Useful for MSI band selection, e.g. '_1' for band 1.\n"
+                             "Leave empty to process all images in the folder.")
         
         # Output folder
         folder_row2 = ttk.Frame(settings_frame)
@@ -867,6 +1068,9 @@ class ThermalCalibrationApp:
         self.output_entry.pack(side=tk.LEFT, padx=5)
         ttk.Button(folder_row2, text="Browse", 
                    command=self._browse_output_folder).pack(side=tk.LEFT)
+        
+        # Explicit file list (hidden storage for Files… selection)
+        self._selected_survey_files: List[str] = []
         
         # Calibration summary
         summary_frame = ttk.LabelFrame(self.tab_processing, text="Calibration Summary")
@@ -963,13 +1167,14 @@ class ThermalCalibrationApp:
         
         # Update UI
         if self.active_target_index < len(self.target_rows):
-            self.target_rows[self.active_target_index].set_stats(mean_val, std_val)
+            self.target_rows[self.active_target_index].set_stats(mean_val, std_val, self._unit())
         
         # Redraw display to show filled polygon with label
         self._update_display()
         
+        u = self._unit()
         self.status_var.set(f"Polygon T{self.active_target_index+1} complete. "
-                           f"Mean: {mean_val:.2f}°C. Enter ground truth temperature.")
+                           f"Mean: {mean_val:.2f}{u}. Enter ground truth value.")
         
         # Auto-calculate coefficients
         self._auto_calculate_coefficients()
@@ -1002,13 +1207,17 @@ class ThermalCalibrationApp:
                 on_gt_change=self._on_gt_change
             )
             row.set_ground_truth(target.ground_truth)
-            row.set_stats(target.drone_mean, target.drone_std)
+            row.set_stats(target.drone_mean, target.drone_std, self._unit())
             self.target_rows.append(row)
             
     def _add_target(self):
         """Add a new target to the current calibration event."""
         if not self.calibration_events:
             self.status_var.set("Please load calibration images first.")
+            return
+
+        if self._is_single_point():
+            self.status_var.set("Single-point MSI uses exactly one CRP target.")
             return
             
         event = self.calibration_events[self.current_event_index]
@@ -1028,11 +1237,12 @@ class ThermalCalibrationApp:
             
         event = self.calibration_events[self.current_event_index]
         
-        if len(event.targets) <= 2:
-            self.status_var.set("Minimum of 2 targets required for calibration.")
+        min_targets = 1 if self._is_single_point() else 2
+        if len(event.targets) <= min_targets:
+            self.status_var.set(f"Minimum of {min_targets} target(s) required.")
             return
             
-        event.remove_target(index)
+        event.remove_target(index, min_targets=min_targets)
         self._rebuild_target_rows()
         self._update_display()
         self._auto_calculate_coefficients()
@@ -1117,6 +1327,9 @@ class ThermalCalibrationApp:
                 timestamp=timestamp or datetime.now()
             )
             self.calibration_events.append(event)
+
+        # Apply current mode constraints to newly loaded events.
+        self._normalize_targets_for_mode()
         
         self.calibration_events.sort(key=lambda e: e.timestamp)
         
@@ -1180,12 +1393,20 @@ class ThermalCalibrationApp:
     def _update_coeff_display(self):
         """Update the coefficients display for current event."""
         if not self.calibration_events:
-            self.coeff_label.config(text="m = -, b = -, R² = -")
+            if self._is_single_point():
+                self.coeff_label.config(text="K = - (define CRP target)")
+            else:
+                self.coeff_label.config(text="m = -, b = -, R² = -")
             return
             
         event = self.calibration_events[self.current_event_index]
         
-        if event.r_squared > 0:
+        if self._is_single_point():
+            if event.r_squared > 0:
+                self.coeff_label.config(text=f"K = {event.slope_m:.8f}")
+            else:
+                self.coeff_label.config(text="K = - (define CRP target)")
+        elif event.r_squared > 0:
             self.coeff_label.config(
                 text=f"m = {event.slope_m:.4f}, b = {event.intercept_b:.4f}, R² = {event.r_squared:.4f}"
             )
@@ -1276,7 +1497,7 @@ class ThermalCalibrationApp:
                     self._draw_filled_polygon(i, target.polygon, target.color)
         
     def _on_mouse_move(self, event):
-        """Display temperature at cursor position."""
+        """Display value at cursor position."""
         if self.current_image is None:
             return
             
@@ -1284,12 +1505,13 @@ class ThermalCalibrationApp:
         y = int(event.y / self.image_scale)
         
         h, w = self.current_image.shape[:2]
+        u = self._unit()
         
         if 0 <= x < w and 0 <= y < h:
-            temp = self.current_image[y, x]
-            self.temp_label.config(text=f"Temperature: {temp:.2f} °C | Pixel: ({x}, {y})")
+            val = self.current_image[y, x]
+            self.temp_label.config(text=f"Value: {val:.2f} {u} | Pixel: ({x}, {y})")
         else:
-            self.temp_label.config(text="Temperature: - °C | Move cursor over image")
+            self.temp_label.config(text=self._readout_idle())
             
     def _auto_calculate_coefficients(self):
         """Automatically calculate coefficients when enough data is available."""
@@ -1298,24 +1520,37 @@ class ThermalCalibrationApp:
             
         event = self.calibration_events[self.current_event_index]
         
-        drone_temps = []
+        drone_vals = []
         ground_truths = []
         
         for target in event.targets:
             if target.drone_mean != 0 and target.ground_truth != 0:
-                drone_temps.append(target.drone_mean)
+                drone_vals.append(target.drone_mean)
                 ground_truths.append(target.ground_truth)
         
-        if len(drone_temps) >= 2:
-            m, b, r2 = compute_linear_regression(drone_temps, ground_truths)
-            event.slope_m = m
-            event.intercept_b = b
-            event.r_squared = r2
-            self.status_var.set(f"Coefficients updated: m={m:.4f}, b={b:.4f}, R²={r2:.4f}")
+        if self._is_single_point():
+            # K = ρ_CRP / DN_CRP  (slope=K, intercept=0)
+            if len(drone_vals) >= 1:
+                K = ground_truths[0] / drone_vals[0]
+                event.slope_m = K
+                event.intercept_b = 0.0
+                event.r_squared = 1.0  # perfect by definition
+                self.status_var.set(f"K = {K:.8f}  (ρ={ground_truths[0]}, DN={drone_vals[0]:.2f})")
+            else:
+                event.slope_m = 1.0
+                event.intercept_b = 0.0
+                event.r_squared = 0.0
         else:
-            event.slope_m = 1.0
-            event.intercept_b = 0.0
-            event.r_squared = 0.0
+            if len(drone_vals) >= 2:
+                m, b, r2 = compute_linear_regression(drone_vals, ground_truths)
+                event.slope_m = m
+                event.intercept_b = b
+                event.r_squared = r2
+                self.status_var.set(f"Coefficients updated: m={m:.4f}, b={b:.4f}, R²={r2:.4f}")
+            else:
+                event.slope_m = 1.0
+                event.intercept_b = 0.0
+                event.r_squared = 0.0
         
         self._update_coeff_display()
         self._update_summary()
@@ -1344,7 +1579,9 @@ class ThermalCalibrationApp:
             return
             
         RegressionPlotDialog(self.root, drone_temps, ground_truths, labels,
-                             title=f"Regression for {Path(event.image_path).name}")
+                             title=f"Regression for {Path(event.image_path).name}",
+                             xlabel="Drone ROI mean (°C)" if self._is_thermal() else "Drone ROI mean DN",
+                             ylabel="Ground Truth (°C)" if self._is_thermal() else "Ground Truth Reflectance (0–1)")
         
     def _update_summary(self):
         """Update calibration summary in processing tab."""
@@ -1372,14 +1609,20 @@ class ThermalCalibrationApp:
                 self.summary_text.insert(tk.END, f"  Targets: {len(event.targets)}\n")
                 
                 if event.r_squared > 0:
-                    self.summary_text.insert(tk.END, 
-                        f"  ✓ m = {event.slope_m:.4f}, b = {event.intercept_b:.4f}, R² = {event.r_squared:.4f}\n")
+                    if self._is_single_point():
+                        self.summary_text.insert(tk.END,
+                            f"  ✓ K = {event.slope_m:.8f}\n")
+                    else:
+                        self.summary_text.insert(tk.END, 
+                            f"  ✓ m = {event.slope_m:.4f}, b = {event.intercept_b:.4f}, R² = {event.r_squared:.4f}\n")
                 else:
                     self.summary_text.insert(tk.END, "  ✗ Coefficients: NOT READY\n")
                 self.summary_text.insert(tk.END, "\n")
                 
             self.summary_text.insert(tk.END, "-" * 60 + "\n")
-            if len(self.calibration_events) == 1:
+            if self._is_single_point():
+                self.summary_text.insert(tk.END, "Method: Single-Point  ρ_pixel = K × DN_pixel\n")
+            elif len(self.calibration_events) == 1:
                 self.summary_text.insert(tk.END, "Mode: Single calibration (constant m, b)\n")
             else:
                 self.summary_text.insert(tk.END, "Mode: Temporal interpolation (m, b vary by timestamp)\n")
@@ -1393,9 +1636,28 @@ class ThermalCalibrationApp:
     def _browse_survey_folder(self):
         folder = filedialog.askdirectory(title="Select Survey Images Folder")
         if folder:
+            self._selected_survey_files.clear()
             self.survey_entry.delete(0, tk.END)
             self.survey_entry.insert(0, folder)
-            
+
+    def _browse_survey_files(self):
+        """Let user pick individual images instead of a whole folder."""
+        filepaths = filedialog.askopenfilenames(
+            title="Select Survey Images",
+            filetypes=[
+                ("Image files", "*.tif *.tiff *.jpg *.jpeg *.png"),
+                ("All files", "*.*")
+            ]
+        )
+        if filepaths:
+            self._selected_survey_files = list(filepaths)
+            self.survey_entry.delete(0, tk.END)
+            # Show filenames so the user can verify the selection
+            names = [os.path.basename(p) for p in filepaths]
+            display = "; ".join(names)
+            self.survey_entry.insert(0, display)
+            self.survey_entry.xview_moveto(0)  # scroll to start
+
     def _browse_output_folder(self):
         folder = filedialog.askdirectory(title="Select Output Folder")
         if folder:
@@ -1420,35 +1682,51 @@ class ThermalCalibrationApp:
         if not calibrated_events:
             self.status_var.set("Error: No calibration coefficients calculated.")
             return
-            
-        survey_folder = self.survey_entry.get()
-        if not survey_folder or not os.path.isdir(survey_folder):
-            self.status_var.set("Error: Invalid survey images folder.")
-            return
-            
+        
+        # --- Collect survey images from folder or explicit file list ---
+        extensions = {'.tif', '.tiff', '.jpg', '.jpeg', '.png'}
+        
+        if self._selected_survey_files:
+            # User picked specific files via "Files…" button
+            survey_images = {Path(p) for p in self._selected_survey_files
+                            if Path(p).suffix.lower() in extensions}
+            # Derive a default output folder from first file's parent
+            default_out_base = Path(self._selected_survey_files[0]).parent
+        else:
+            survey_folder = self.survey_entry.get()
+            if not survey_folder or not os.path.isdir(survey_folder):
+                self.status_var.set("Error: Invalid survey images folder.")
+                return
+            survey_images = set()
+            for f in Path(survey_folder).iterdir():
+                if f.is_file() and f.suffix.lower() in extensions:
+                    survey_images.add(f)
+            default_out_base = Path(survey_folder)
+        
+        # Apply filename filter
+        name_filter = self.filter_var.get().strip()
+        if name_filter:
+            survey_images = {p for p in survey_images if name_filter in p.name}
+        
         output_folder = self.output_entry.get()
         if not output_folder:
-            output_folder = os.path.join(survey_folder, "calibrated")
+            output_folder = str(default_out_base / "calibrated")
             self.output_entry.delete(0, tk.END)
             self.output_entry.insert(0, output_folder)
             
         os.makedirs(output_folder, exist_ok=True)
         
-        self.emissivity_settings.enabled = self.emis_enabled.get()
-        try:
-            self.emissivity_settings.target_emissivity = float(self.emis_value.get())
-            self.emissivity_settings.sky_temperature = float(self.tsky_value.get())
-        except ValueError:
-            pass
-        
-        # Find survey images - DEDUPLICATE to fix double processing bug
-        extensions = {'.tif', '.tiff', '.jpg', '.jpeg', '.png'}
-        survey_images = set()
-        
-        for f in Path(survey_folder).iterdir():
-            if f.is_file() and f.suffix.lower() in extensions:
-                survey_images.add(f)
-        
+        # Emissivity only applies in thermal mode
+        if self._is_thermal():
+            self.emissivity_settings.enabled = self.emis_enabled.get()
+            try:
+                self.emissivity_settings.target_emissivity = float(self.emis_value.get())
+                self.emissivity_settings.sky_temperature = float(self.tsky_value.get())
+            except ValueError:
+                pass
+        else:
+            self.emissivity_settings.enabled = False
+
         # Remove calibration images
         calib_paths = {Path(e.image_path).resolve() for e in self.calibration_events}
         survey_images = [p for p in survey_images if p.resolve() not in calib_paths]
@@ -1457,10 +1735,18 @@ class ThermalCalibrationApp:
         if not survey_images:
             self.status_var.set("Error: No survey images found.")
             return
-            
+        
+        mode_str = "Thermal" if self._is_thermal() else "MSI"
+        single_pt = self._is_single_point()
+        self._log(f"Mode: {mode_str}" + (" (Single-Point K)" if single_pt else ""))
+        if name_filter:
+            self._log(f"Filename filter: '{name_filter}'")
         self._log(f"Found {len(survey_images)} survey images to process.")
         self._log(f"Using {len(calibrated_events)} calibration event(s).")
-        self._log(f"Calibration mode: {'Interpolation' if len(calibrated_events) > 1 else 'Single'}")
+        if single_pt:
+            self._log(f"Calibration method: Single-Point  K = ρ_CRP / DN_CRP")
+        else:
+            self._log(f"Calibration mode: {'Interpolation' if len(calibrated_events) > 1 else 'Single'}")
         
         if self.emissivity_settings.enabled:
             self._log(f"Emissivity correction: ENABLED\n"
@@ -1509,24 +1795,30 @@ class ThermalCalibrationApp:
                 save_calibrated_geotiff(calibrated, output_path, str(img_path))
                 
                 # Detailed log entry
-                log_data.append({
+                u = 'celsius' if self._is_thermal() else 'reflectance'
+                entry = {
                     'input_filename': filename,
                     'output_filename': output_name,
                     'timestamp_extracted': timestamp.isoformat(),
-                    'slope_m': round(m, 6),
-                    'intercept_b': round(b, 6),
-                    'formula_applied': f"T_out = {m:.6f} * T_in + {b:.6f}",
                     'emissivity_corrected': self.emissivity_settings.enabled,
                     'emissivity_value': self.emissivity_settings.target_emissivity if self.emissivity_settings.enabled else None,
                     'sky_temp_celsius': self.emissivity_settings.sky_temperature if self.emissivity_settings.enabled else None,
-                    'original_mean_celsius': round(original_mean, 4),
-                    'original_min_celsius': round(original_min, 4),
-                    'original_max_celsius': round(original_max, 4),
-                    'calibrated_mean_celsius': round(calibrated_mean, 4),
-                    'calibrated_min_celsius': round(calibrated_min, 4),
-                    'calibrated_max_celsius': round(calibrated_max, 4),
-                    'mean_shift_celsius': round(calibrated_mean - original_mean, 4),
-                })
+                    f'original_mean_{u}': round(original_mean, 4),
+                    f'original_min_{u}': round(original_min, 4),
+                    f'original_max_{u}': round(original_max, 4),
+                    f'calibrated_mean_{u}': round(calibrated_mean, 4),
+                    f'calibrated_min_{u}': round(calibrated_min, 4),
+                    f'calibrated_max_{u}': round(calibrated_max, 4),
+                    f'mean_shift_{u}': round(calibrated_mean - original_mean, 4),
+                }
+                if single_pt:
+                    entry['K'] = round(m, 10)
+                    entry['formula_applied'] = f"Refl = {m:.10f} * DN"
+                else:
+                    entry['slope_m'] = round(m, 6)
+                    entry['intercept_b'] = round(b, 6)
+                    entry['formula_applied'] = f"Out = {m:.6f} * In + {b:.6f}"
+                log_data.append(entry)
                 
                 progress = (i + 1) / total * 100
                 self.progress_var.set(progress)
@@ -1543,10 +1835,16 @@ class ThermalCalibrationApp:
         
         # Save human-readable summary
         summary_path = os.path.join(output_folder, "processing_summary.txt")
+        mode_str = "Thermal" if self._is_thermal() else "MSI (Multispectral)"
         with open(summary_path, 'w') as f:
-            f.write("THERMAL IMAGE CALIBRATION PROCESSING SUMMARY\n")
+            f.write(f"IMAGE CALIBRATION PROCESSING SUMMARY ({mode_str})\n")
             f.write("=" * 60 + "\n\n")
             f.write(f"Processing Date: {datetime.now().isoformat()}\n")
+            f.write(f"Sensor Mode: {mode_str}\n")
+            if single_pt:
+                f.write("Calibration Method: Single-Point (K = ρ_CRP / DN_CRP)\n")
+            if name_filter:
+                f.write(f"Filename Filter: '{name_filter}'\n")
             f.write(f"Total Images Processed: {len(log_data)}\n\n")
             
             f.write("CALIBRATION SETTINGS\n")
@@ -1570,10 +1868,18 @@ class ThermalCalibrationApp:
                 
             f.write("\n\nTRANSFORMATION EQUATION\n")
             f.write("-" * 40 + "\n")
-            f.write("For each pixel value T_drone (in Celsius):\n")
-            f.write("  T_calibrated = m × T_drone + b\n\n")
-            f.write("Where m and b are interpolated based on image timestamp.\n")
-            f.write("See processing_log.csv for exact m,b values per image.\n")
+            if single_pt:
+                f.write("Single-Point Calibration:\n")
+                f.write("  Reflectance = K × DN\n")
+                f.write("  where K = ρ_CRP / DN_CRP\n\n")
+            elif self._is_thermal():
+                f.write("For each pixel value T_drone (in Celsius):\n")
+                f.write("  T_calibrated = m × T_drone + b\n\n")
+            else:
+                f.write("For each pixel DN value:\n")
+                f.write("  Reflectance = m × DN + b\n\n")
+            f.write("Where coefficients are interpolated based on image timestamp.\n")
+            f.write("See processing_log.csv for exact values per image.\n")
         
         self._log(f"\nProcessing complete!")
         self._log(f"Output folder: {output_folder}")
